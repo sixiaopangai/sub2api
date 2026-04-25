@@ -55,6 +55,7 @@ const (
 	openAIWSRetryJitterRatioDefault    = 0.2
 	openAICompactSessionSeedKey        = "openai_compact_session_seed"
 	codexCLIVersion                    = "0.125.0"
+	openAIModelUnsupportedCooldown     = 6 * time.Hour
 	// Codex 限额快照仅用于后台展示/诊断，不需要每个成功请求都立即落库。
 	openAICodexSnapshotPersistMinInterval = 30 * time.Second
 )
@@ -1252,6 +1253,9 @@ func isOpenAIAccountEligibleForRequest(account *Account, requestedModel string, 
 	if requestedModel != "" && !account.IsModelSupported(requestedModel) {
 		return false
 	}
+	if requestedModel != "" && account.GetModelRateLimitRemainingTime(requestedModel) > 0 {
+		return false
+	}
 	if requireCompact && openAICompactSupportTier(account) == 0 {
 		return false
 	}
@@ -1938,12 +1942,100 @@ func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode i
 	if s.shouldFailoverUpstreamError(statusCode) {
 		return true
 	}
+	if isOpenAIAccountModelUnsupportedResponse(statusCode, upstreamMsg, upstreamBody) {
+		return true
+	}
 	return isOpenAITransientProcessingError(statusCode, upstreamMsg, upstreamBody)
+}
+
+func isOpenAIAccountModelUnsupportedResponse(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	combined := strings.ToLower(strings.TrimSpace(strings.Join([]string{
+		upstreamMsg,
+		gjson.GetBytes(upstreamBody, "detail").String(),
+		gjson.GetBytes(upstreamBody, "error.message").String(),
+		gjson.GetBytes(upstreamBody, "response.error.message").String(),
+		gjson.GetBytes(upstreamBody, "error.code").String(),
+		gjson.GetBytes(upstreamBody, "response.error.code").String(),
+	}, " ")))
+	if combined == "" {
+		return false
+	}
+	if strings.Contains(combined, "model is not supported when using codex with a chatgpt account") {
+		return true
+	}
+	return strings.Contains(combined, "model_not_supported") && strings.Contains(combined, "chatgpt account")
+}
+
+func openAIModelUnsupportedKey(account *Account, requestedModel, upstreamModel string) string {
+	if key := strings.TrimSpace(upstreamModel); key != "" {
+		return key
+	}
+	if account != nil {
+		if key := strings.TrimSpace(account.GetMappedModel(requestedModel)); key != "" {
+			return key
+		}
+	}
+	return strings.TrimSpace(requestedModel)
+}
+
+func newOpenAIModelUnsupportedFailoverError(statusCode int, body []byte, account *Account, requestedModel, upstreamModel string) *UpstreamFailoverError {
+	return &UpstreamFailoverError{
+		StatusCode:          statusCode,
+		ResponseBody:        body,
+		ModelUnsupported:    true,
+		ModelUnsupportedKey: openAIModelUnsupportedKey(account, requestedModel, upstreamModel),
+	}
+}
+
+func (s *OpenAIGatewayService) HandleOpenAIModelUnsupportedFailover(ctx context.Context, groupID *int64, sessionHash string, account *Account, requestedModel, modelKey string) {
+	if s == nil || account == nil {
+		return
+	}
+	resolvedModelKey := openAIModelUnsupportedKey(account, requestedModel, modelKey)
+	resetAt := time.Now().Add(openAIModelUnsupportedCooldown)
+	if resolvedModelKey != "" && s.accountRepo != nil {
+		if err := s.accountRepo.SetModelRateLimit(ctx, account.ID, resolvedModelKey, resetAt); err != nil {
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] model_not_supported mark failed account=%d model=%s err=%v", account.ID, resolvedModelKey, err)
+		} else {
+			logger.LegacyPrintf("service.openai_gateway", "[OpenAI] model_not_supported marked account=%d model=%s reset_in=%v", account.ID, resolvedModelKey, time.Until(resetAt).Truncate(time.Second))
+		}
+	}
+	s.updateOpenAIModelRateLimitInCache(ctx, account, resolvedModelKey, resetAt)
+	if sessionHash != "" {
+		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
+	}
+}
+
+func (s *OpenAIGatewayService) updateOpenAIModelRateLimitInCache(ctx context.Context, account *Account, modelKey string, resetAt time.Time) {
+	if s == nil || s.schedulerSnapshot == nil || account == nil || strings.TrimSpace(modelKey) == "" {
+		return
+	}
+	if account.Extra == nil {
+		account.Extra = make(map[string]any)
+	}
+	limits, _ := account.Extra[modelRateLimitsKey].(map[string]any)
+	if limits == nil {
+		limits = make(map[string]any)
+		account.Extra[modelRateLimitsKey] = limits
+	}
+	now := time.Now().UTC()
+	limits[modelKey] = map[string]any{
+		"rate_limited_at":     now.Format(time.RFC3339),
+		"rate_limit_reset_at": resetAt.UTC().Format(time.RFC3339),
+	}
+	if err := s.schedulerSnapshot.SetAccount(ctx, account); err != nil {
+		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] model_not_supported cache update failed account=%d model=%s err=%v", account.ID, modelKey, err)
+	}
 }
 
 func (s *OpenAIGatewayService) handleFailoverSideEffects(ctx context.Context, resp *http.Response, account *Account) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, body)
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, body)
+	}
 }
 
 // Forward forwards request to OpenAI API
@@ -2614,6 +2706,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				})
 
 				s.handleFailoverSideEffects(ctx, resp, account)
+				if isOpenAIAccountModelUnsupportedResponse(resp.StatusCode, upstreamMsg, respBody) {
+					return nil, newOpenAIModelUnsupportedFailoverError(resp.StatusCode, respBody, account, reqModel, upstreamModel)
+				}
 				return nil, &UpstreamFailoverError{
 					StatusCode:             resp.StatusCode,
 					ResponseBody:           respBody,
@@ -3702,6 +3797,21 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 			account.Type,
 			truncateForLog(body, s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes),
 		)
+	}
+
+	if isOpenAIAccountModelUnsupportedResponse(resp.StatusCode, upstreamMsg, body) {
+		requestedModel, _, _ := extractOpenAIRequestMetaFromBody(requestBody)
+		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
+			Platform:           account.Platform,
+			AccountID:          account.ID,
+			AccountName:        account.Name,
+			UpstreamStatusCode: resp.StatusCode,
+			UpstreamRequestID:  resp.Header.Get("x-request-id"),
+			Kind:               "failover",
+			Message:            upstreamMsg,
+			Detail:             upstreamDetail,
+		})
+		return nil, newOpenAIModelUnsupportedFailoverError(resp.StatusCode, body, account, requestedModel, "")
 	}
 
 	if status, errType, errMsg, matched := applyErrorPassthroughRule(

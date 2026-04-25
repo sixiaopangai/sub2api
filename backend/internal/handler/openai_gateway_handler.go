@@ -331,8 +331,18 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, false, nil)
+				if failoverErr.ModelUnsupported {
+					h.gatewayService.HandleOpenAIModelUnsupportedFailover(
+						c.Request.Context(),
+						apiKey.GroupID,
+						sessionHash,
+						account,
+						reqModel,
+						failoverErr.ModelUnsupportedKey,
+					)
+				}
 				// 池模式：同账号重试
-				if failoverErr.RetryableOnSameAccount {
+				if failoverErr.RetryableOnSameAccount && !failoverErr.ModelUnsupported {
 					retryLimit := account.GetPoolModeRetryCount()
 					if sameAccountRetryCount[account.ID] < retryLimit {
 						sameAccountRetryCount[account.ID]++

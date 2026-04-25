@@ -505,6 +505,8 @@ type UpstreamFailoverError struct {
 	ResponseHeaders        http.Header // 上游响应头，用于透传 cf-ray/cf-mitigated/content-type 等诊断信息
 	ForceCacheBilling      bool        // Antigravity 粘性会话切换时设为 true
 	RetryableOnSameAccount bool        // 临时性错误（如 Google 间歇性 400、空响应），应在同一账号上重试 N 次再切换
+	ModelUnsupported       bool        // 上游明确表示当前账号不支持该模型，应切换账号
+	ModelUnsupportedKey    string      // 需要临时屏蔽的上游模型 key
 }
 
 func (e *UpstreamFailoverError) Error() string {
